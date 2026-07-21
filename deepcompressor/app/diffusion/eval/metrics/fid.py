@@ -16,7 +16,7 @@ def get_dataset_features(
     dataset: Dataset,
     model,
     mode: str = "clean",
-    batch_size: int = 128,
+    batch_size: int = 8,
     device: str | torch.device = "cuda",
 ) -> np.ndarray:
     to_tensor = torchvision.transforms.ToTensor()
@@ -47,7 +47,7 @@ def get_fid_features(
     num: int | None = None,
     mode: str = "clean",
     num_workers: int = 8,
-    batch_size: int = 64,
+    batch_size: int = 8,
     device: str | torch.device = "cuda",
     force_overwrite: bool = False,
     verbose: bool = True,

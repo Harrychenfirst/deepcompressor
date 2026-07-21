@@ -14,7 +14,7 @@ eval:
   height: null
   width: null
   guidance_scale: null
-  num_steps: null
+  num_steps: 30
   gt_metrics: ["clip_iqa", "clip_score", "image_reward", "fid"]
   ref_metrics: ["psnr", "lpips", "ssim", "fid"]
   gen_root: "{output}/{job}"
@@ -49,8 +49,8 @@ quant:
       objective: OutputsError
       strategy: Manual
       granularity: Layer
-      element_batch_size: 64
-      sample_batch_size: 64
+      element_batch_size: 8
+      sample_batch_size: 8
       element_size: 512
       sample_size: -1
       ratio: 1.0
@@ -65,7 +65,7 @@ quant:
       early_stop: false
       degree: 2
       objective: OutputsError
-      sample_batch_size: 64
+      sample_batch_size: 8
       sample_size: -1
       num_iters: 1
       skips: []
@@ -86,8 +86,8 @@ quant:
       objective: OutputsError
       strategy: Manual
       granularity: Layer
-      element_batch_size: 64
-      sample_batch_size: 64
+      element_batch_size: 8
+      sample_batch_size: 8
       element_size: 512
       sample_size: -1
       ratio: 1.0
@@ -104,7 +104,7 @@ quant:
       strategy: Manual
       granularity: Layer
       element_batch_size: -1
-      sample_batch_size: 64
+      sample_batch_size: 8
       element_size: -1
       sample_size: -1
       pre_reshape: true

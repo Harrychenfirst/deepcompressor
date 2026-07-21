@@ -12,12 +12,11 @@ from deepcompressor.data.cache import IOTensorsCache
 from deepcompressor.data.common import TensorType
 from deepcompressor.utils import tools
 
+from ..graph import ensure_model_adapter, iter_activation_group_specs
 from ..nn.struct import (
-    DiffusionAttentionStruct,
     DiffusionBlockStruct,
     DiffusionModelStruct,
     DiffusionModuleStruct,
-    DiffusionTransformerBlockStruct,
 )
 from .config import DiffusionQuantConfig
 from .quantizer import DiffusionActivationQuantizer
@@ -74,71 +73,22 @@ def quantize_diffusion_block_activations(  # noqa: C901
     ] = []
     In, Out = TensorType.Inputs, TensorType.Outputs  # noqa: F841
 
-    used_modules: set[nn.Module] = set()
-    for module_key, module_name, module, parent, field_name in layer.named_key_modules():
-        modules, orig_struct_wgts = None, {}
-        if field_name in ("k_proj", "v_proj", "add_q_proj", "add_v_proj"):
-            continue
-        if field_name in ("q_proj", "add_k_proj", "up_proj"):
-            grandparent = parent.parent
-            assert isinstance(grandparent, DiffusionTransformerBlockStruct)
-            if grandparent.parallel and parent.idx == 0:
-                if orig_state_dict:
-                    orig_struct_wgts = {
-                        proj_module: (proj_module.weight, orig_state_dict[f"{proj_name}.weight"])
-                        for _, proj_name, proj_module, _, _ in grandparent.named_key_modules()
-                    }
-                if field_name == "q_proj":
-                    assert isinstance(parent, DiffusionAttentionStruct)
-                    assert module_name == parent.q_proj_name
-                    modules, module_names = parent.qkv_proj, parent.qkv_proj_names
-                    if grandparent.ffn_struct is not None:
-                        modules.append(grandparent.ffn_struct.up_proj)
-                        module_names.append(grandparent.ffn_struct.up_proj_name)
-                elif field_name == "add_k_proj":
-                    assert isinstance(parent, DiffusionAttentionStruct)
-                    assert module_name == parent.add_k_proj_name
-                    modules, module_names = parent.add_qkv_proj, parent.add_qkv_proj_names
-                    if grandparent.add_ffn_struct is not None:
-                        modules.append(grandparent.add_ffn_struct.up_proj)
-                        module_names.append(grandparent.add_ffn_struct.up_proj_name)
-                else:
-                    assert field_name == "up_proj"
-                    if module in used_modules:
-                        continue
-                    assert module_name == grandparent.add_ffn_struct.up_proj_name
-                    assert grandparent.attn_structs[0].is_self_attn()
-                eval_module, eval_name, eval_kwargs = grandparent.module, grandparent.name, layer_kwargs
-            elif isinstance(parent, DiffusionAttentionStruct):
-                eval_module, eval_name = parent.module, parent.name
-                eval_kwargs = parent.filter_kwargs(layer_kwargs) if layer_kwargs else {}
-                if orig_state_dict:
-                    orig_struct_wgts = {
-                        proj_module: (proj_module.weight, orig_state_dict[f"{proj_name}.weight"])
-                        for _, proj_name, proj_module, _, _ in parent.named_key_modules()
-                    }
-                if field_name == "q_proj":
-                    assert module_name == parent.q_proj_name
-                    modules, module_names = parent.qkv_proj, parent.qkv_proj_names
-                else:
-                    assert field_name == "add_k_proj"
-                    assert module_name == parent.add_k_proj_name
-                    modules, module_names = parent.add_qkv_proj, parent.add_qkv_proj_names
-        if modules is None:
-            assert module not in used_modules
-            used_modules.add(module)
-            orig_wgts = [(module.weight, orig_state_dict[f"{module_name}.weight"])] if orig_state_dict else None
-            args_caches.append((module_key, In, [module], [module_name], module, module_name, None, orig_wgts))
-        else:
-            orig_wgts = []
-            for proj_module in modules:
-                assert proj_module not in used_modules
-                used_modules.add(proj_module)
-                if orig_state_dict:
-                    orig_wgts.append(orig_struct_wgts.pop(proj_module))
-            orig_wgts.extend(orig_struct_wgts.values())
-            orig_wgts = None if not orig_wgts else orig_wgts
-            args_caches.append((module_key, In, modules, module_names, eval_module, eval_name, eval_kwargs, orig_wgts))
+    for spec in iter_activation_group_specs(layer, layer_kwargs=layer_kwargs):
+        orig_wgts = None
+        if orig_state_dict:
+            orig_wgts = [(weight, orig_state_dict[f"{name}.weight"]) for weight, name in spec.orig_weight_refs]
+        args_caches.append(
+            (
+                spec.key,
+                In,
+                list(spec.modules),
+                list(spec.module_names),
+                spec.eval_module,
+                spec.eval_name,
+                spec.eval_kwargs,
+                orig_wgts,
+            )
+        )
     # endregion
     quantizers: dict[str, DiffusionActivationQuantizer] = {}
     tools.logging.Formatter.indent_inc()
@@ -213,26 +163,27 @@ def quantize_diffusion_activations(
             The activation quantizers state dict cache.
     """
     logger = tools.logging.getLogger(f"{__name__}.ActivationQuant")
-    if not isinstance(model, DiffusionModelStruct):
-        model = DiffusionModelStruct.construct(model)
-    assert isinstance(model, DiffusionModelStruct)
+    adapter = ensure_model_adapter(model)
     quantizer_state_dict = quantizer_state_dict or {}
     quantizers: dict[str, DiffusionActivationQuantizer] = {}
-    skip_pre_modules = all(key in config.ipts.skips for key in model.get_prev_module_keys())
-    skip_post_modules = all(key in config.ipts.skips for key in model.get_post_module_keys())
+    skip_pre_modules = all(key in config.ipts.skips for key in adapter.get_prev_keys())
+    skip_post_modules = all(key in config.ipts.skips for key in adapter.get_post_keys())
     if not quantizer_state_dict and config.needs_acts_quantizer_cache:
+        activation_plan = adapter.get_activation_plan(
+            skip_pre_modules=skip_pre_modules, skip_post_modules=skip_post_modules
+        )
         with tools.logging.redirect_tqdm():
             for _, (layer, layer_cache, layer_kwargs) in tqdm(
                 config.calib.build_loader().iter_layer_activations(
-                    model,
-                    needs_inputs_fn=get_needs_inputs_fn(model, config=config),
-                    needs_outputs_fn=get_needs_outputs_fn(model, config=config),
+                    adapter,
+                    needs_inputs_fn=get_needs_inputs_fn(adapter, config=config),
+                    needs_outputs_fn=get_needs_outputs_fn(adapter, config=config),
                     skip_pre_modules=skip_pre_modules,
                     skip_post_modules=skip_post_modules,
                 ),
                 desc="quantizing activations",
                 leave=False,
-                total=model.num_blocks + int(not skip_post_modules) + int(not skip_pre_modules) * 3,
+                total=len(activation_plan.layers),
                 dynamic_ncols=True,
             ):
                 block_quantizers = quantize_diffusion_block_activations(
@@ -245,7 +196,7 @@ def quantize_diffusion_activations(
                 )
                 quantizers.update(block_quantizers)
     else:
-        for _, layer in model.get_named_layers(
+        for _, layer in adapter.get_named_layers(
             skip_pre_modules=skip_pre_modules, skip_post_modules=skip_post_modules
         ).items():
             block_quantizers = quantize_diffusion_block_activations(
@@ -255,7 +206,9 @@ def quantize_diffusion_activations(
                 orig_state_dict=orig_state_dict,
             )
             quantizers.update(block_quantizers)
-    for _, module_name, module, _, _ in model.named_key_modules():
+    for node in adapter.iter_nodes():
+        module_name = node.name
+        module = node.module
         ipts_quantizer = quantizers.get(f"{module_name}.input", None)
         opts_quantizer = quantizers.get(f"{module_name}.output", None)
         needs_quant_ipts = ipts_quantizer is not None and ipts_quantizer.is_enabled()

@@ -13,6 +13,7 @@ from diffusers.pipelines import (
     FluxFillPipeline,
     SanaPipeline,
 )
+from diffusers.pipelines.flux2 import Flux2KleinPipeline
 from omniconfig import configclass
 from torch import nn
 from transformers import PreTrainedModel, PreTrainedTokenizer, T5EncoderModel
@@ -25,6 +26,7 @@ from deepcompressor.utils.hooks import AccumBranchHook, ProcessHook
 from ....nn.patch.linear import ConcatLinear, ShiftedLinear
 from ....nn.patch.lowrank import LowRankBranch
 from ..nn.patch import (
+    replace_flux2_parallel_attn,
     replace_fused_linear_with_concat_linear,
     replace_up_block_conv_with_concat_conv,
     shift_input_activations,
@@ -141,7 +143,16 @@ class DiffusionPipelineConfig:
             `list[tuple[str, PreTrainedModel, PreTrainedTokenizer]]`:
                 The list of text encoder name, model, and tokenizer.
         """
-        _extractor = self._text_extractors.get(self.name, self._default_extract_text_encoders)
+        _extractor = self._text_extractors.get(self.name)
+        if _extractor is None:
+            # Fall back to a prefix match so variant names (e.g. "flux.2-klein-base-9b")
+            # still resolve to the extractor registered under "flux.2-klein".
+            for key, extractor in self._text_extractors.items():
+                if self.name.startswith(key):
+                    _extractor = extractor
+                    break
+        if _extractor is None:
+            _extractor = self._default_extract_text_encoders
         return _extractor(pipeline, supported)
 
     @classmethod
@@ -324,7 +335,7 @@ class DiffusionPipelineConfig:
         model.register_module("_low_rank_branches", branches)
 
     @staticmethod
-    def _default_build(
+    def _default_build(  # noqa: C901
         name: str, path: str, dtype: str | torch.dtype, device: str | torch.device, shift_activations: bool
     ) -> DiffusionPipeline:
         if not path:
@@ -344,12 +355,16 @@ class DiffusionPipelineConfig:
                 path = "black-forest-labs/FLUX.1-Fill-dev"
             elif name == "flux.1-schnell":
                 path = "black-forest-labs/FLUX.1-schnell"
+            elif name.startswith("flux.2-klein"):
+                path = "black-forest-labs/FLUX.2-klein-4B"
             else:
                 raise ValueError(f"Path for {name} is not specified.")
         if name in ["flux.1-canny-dev", "flux.1-depth-dev"]:
             pipeline = FluxControlPipeline.from_pretrained(path, torch_dtype=dtype)
         elif name == "flux.1-fill-dev":
             pipeline = FluxFillPipeline.from_pretrained(path, torch_dtype=dtype)
+        elif name.startswith("flux.2-klein"):
+            pipeline = Flux2KleinPipeline.from_pretrained(path, torch_dtype=dtype)
         elif name.startswith("sana-"):
             if dtype == torch.bfloat16:
                 pipeline = SanaPipeline.from_pretrained(path, variant="bf16", torch_dtype=dtype, use_safetensors=True)
@@ -362,6 +377,7 @@ class DiffusionPipelineConfig:
         pipeline = pipeline.to(device)
         model = pipeline.unet if hasattr(pipeline, "unet") else pipeline.transformer
         replace_fused_linear_with_concat_linear(model)
+        replace_flux2_parallel_attn(model)
         replace_up_block_conv_with_concat_conv(model)
         if shift_activations:
             shift_input_activations(model)
@@ -391,3 +407,16 @@ class DiffusionPipelineConfig:
                 if not supported or isinstance(encoder, supported):
                     results.append((key, encoder, tokenizer))
         return results
+
+    @staticmethod
+    def _flux2_extract_text_encoders(
+        pipeline: DiffusionPipeline, supported: tuple[type[PreTrainedModel], ...]
+    ) -> list[tuple[str, PreTrainedModel, PreTrainedTokenizer]]:
+        """Extract text encoders from Flux2 pipelines (uses Qwen3 text encoder)."""
+        results: list[tuple[str, PreTrainedModel, PreTrainedTokenizer]] = []
+        if hasattr(pipeline, "text_encoder") and pipeline.text_encoder is not None:
+            results.append(("text_encoder", pipeline.text_encoder, pipeline.tokenizer))
+        return results
+
+
+DiffusionPipelineConfig.register_text_extractor("flux.2-klein", DiffusionPipelineConfig._flux2_extract_text_encoders)

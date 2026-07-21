@@ -298,6 +298,21 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
     logger.info("* Building diffusion model pipeline")
     tools.logging.Formatter.indent_inc()
     pipeline = config.pipeline.build()
+    # Flux2 uses a large Qwen3 text encoder that is not needed during transformer
+    # quantization (calibration reads cached activations; LoRA/text quant are disabled
+    # here). Offload it to CPU to free GPU memory for the 9B transformer, then move it
+    # back before evaluation, which needs it to encode prompts.
+    offloaded_text_encoder = False
+    if (
+        config.pipeline.family == "flux.2"
+        and getattr(pipeline, "text_encoder", None) is not None
+        and (config.text is None or not config.text.is_enabled())
+    ):
+        logger.info("* Offloading text encoder to CPU during quantization")
+        pipeline.text_encoder.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        offloaded_text_encoder = True
     if "nf4" not in config.pipeline.name and "gguf" not in config.pipeline.name:
         model = DiffusionModelStruct.construct(pipeline)
         tools.logging.Formatter.indent_dec()
@@ -351,6 +366,11 @@ def main(config: DiffusionPtqRunConfig, logging_level: int = tools.logging.DEBUG
                     save_model=save_model,
                 ),
             )
+    if offloaded_text_encoder:
+        logger.info("* Moving text encoder back to GPU for evaluation")
+        pipeline.text_encoder.to(config.pipeline.device)
+        gc.collect()
+        torch.cuda.empty_cache()
     config.eval.gen_root = config.eval.gen_root.format(
         output=config.output.running_dirpath, job=config.output.running_job_dirname
     )

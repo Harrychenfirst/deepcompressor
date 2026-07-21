@@ -13,10 +13,11 @@ from deepcompressor.data.zero import ZeroPointDomain
 from deepcompressor.nn.patch.lowrank import LowRankBranch
 from deepcompressor.utils import tools
 
-from ..nn.struct import DiffusionAttentionStruct, DiffusionBlockStruct, DiffusionModelStruct, DiffusionModuleStruct
+from ..graph import ensure_model_adapter, iter_low_rank_group_specs, resolve_eval_scope
+from ..nn.struct import DiffusionBlockStruct, DiffusionModelStruct, DiffusionModuleStruct
 from .config import DiffusionQuantConfig
 from .quantizer import DiffusionActivationQuantizer, DiffusionWeightQuantizer
-from .utils import get_needs_inputs_fn, wrap_joint_attn
+from .utils import get_needs_inputs_fn
 
 __all__ = ["quantize_diffusion_weights", "load_diffusion_weights_state_dict"]
 
@@ -48,45 +49,14 @@ def calibrate_diffusion_block_low_rank_branch(  # noqa: C901
     logger.debug("- Calibrating low-rank branches of block %s", layer.name)
     layer_cache = layer_cache or {}
     layer_kwargs = layer_kwargs or {}
-    for module_key, module_name, module, parent, field_name in layer.named_key_modules():
-        modules, module_names = [module], [module_name]
-        if not config.wgts.low_rank.exclusive:
-            if field_name.endswith(("q_proj", "k_proj", "v_proj")):
-                assert isinstance(parent, DiffusionAttentionStruct)
-                if parent.is_self_attn():
-                    if field_name == "q_proj":
-                        modules, module_names = parent.qkv_proj, parent.qkv_proj_names
-                    else:
-                        continue
-                elif parent.is_cross_attn():
-                    if field_name == "add_k_proj":
-                        modules.append(parent.add_v_proj)
-                        module_names.append(parent.add_v_proj_name)
-                    elif field_name != "q_proj":
-                        continue
-                else:
-                    assert parent.is_joint_attn()
-                    if field_name == "q_proj":
-                        modules, module_names = parent.qkv_proj, parent.qkv_proj_names
-                    elif field_name == "add_k_proj":
-                        modules, module_names = parent.add_qkv_proj, parent.add_qkv_proj_names
-                    else:
-                        continue
-        if field_name.endswith(("q_proj", "k_proj")):
-            assert isinstance(parent, DiffusionAttentionStruct)
-            if parent.parent.parallel and parent.idx == 0:
-                eval_module = parent.parent.module
-                eval_name = parent.parent.name
-                eval_kwargs = layer_kwargs
-            else:
-                eval_module = parent.module
-                eval_name = parent.name
-                eval_kwargs = parent.filter_kwargs(layer_kwargs)
-            if parent.is_joint_attn() and "add_" in field_name:
-                eval_module = wrap_joint_attn(eval_module, indexes=1)
-        else:
-            eval_module, eval_name, eval_kwargs = module, module_name, None
-        if isinstance(modules[0], nn.Linear):
+    for spec in iter_low_rank_group_specs(layer, layer_kwargs=layer_kwargs, exclusive=config.wgts.low_rank.exclusive):
+        modules = list(spec.modules)
+        module_names = list(spec.module_names)
+        module = modules[0]
+        module_name = module_names[0]
+        module_key = spec.key
+        eval_module, eval_name, eval_kwargs = spec.eval_module, spec.eval_name, spec.eval_kwargs
+        if isinstance(module, nn.Linear):
             assert all(isinstance(m, nn.Linear) for m in modules)
             channels_dim = -1
         else:
@@ -173,20 +143,13 @@ def update_diffusion_block_weight_quantizer_state_dict(
     logger.debug("- Calibrating weights: block %s", layer.name)
     tools.logging.Formatter.indent_inc()
     for module_key, module_name, module, parent, field_name in layer.named_key_modules():
-        if field_name.endswith(("q_proj", "k_proj")):
-            assert isinstance(parent, DiffusionAttentionStruct)
-            if parent.parent.parallel and parent.idx == 0:
-                eval_module = parent.parent.module
-                eval_name = parent.parent.name
-                eval_kwargs = layer_kwargs
-            else:
-                eval_module = parent.module
-                eval_name = parent.name
-                eval_kwargs = parent.filter_kwargs(layer_kwargs)
-            if parent.is_joint_attn() and "add_" in field_name:
-                eval_module = wrap_joint_attn(eval_module, indexes=1)
-        else:
-            eval_module, eval_name, eval_kwargs = module, module_name, None
+        eval_module, eval_name, eval_kwargs = resolve_eval_scope(
+            module=module,
+            module_name=module_name,
+            parent=parent,
+            field_name=field_name,
+            layer_kwargs=layer_kwargs,
+        )
         config_wgts = config.wgts
         if config.enabled_extra_wgts and config.extra_wgts.is_enabled_for(module_key):
             config_wgts = config.extra_wgts
@@ -327,9 +290,8 @@ def quantize_diffusion_weights(
             The state dict of the weight quantizers, the state dict of the low-rank branches, and the scale state dict.
     """
     logger = tools.logging.getLogger(f"{__name__}.WeightQuant")
-    if not isinstance(model, DiffusionModelStruct):
-        model = DiffusionModelStruct.construct(model)
-    assert isinstance(model, DiffusionModelStruct)
+    adapter = ensure_model_adapter(model)
+    model = adapter.get_root_module()
     quantizer_state_dict = quantizer_state_dict or {}
     branch_state_dict = branch_state_dict or {}
 
@@ -339,7 +301,7 @@ def quantize_diffusion_weights(
         with tools.logging.redirect_tqdm():
             if branch_state_dict:
                 for _, layer in tqdm(
-                    model.get_named_layers(skip_pre_modules=True, skip_post_modules=True).items(),
+                    adapter.get_named_layers(skip_pre_modules=True, skip_post_modules=True).items(),
                     desc="adding low-rank branches",
                     leave=False,
                     dynamic_ncols=True,
@@ -348,16 +310,17 @@ def quantize_diffusion_weights(
                         layer=layer, config=config, branch_state_dict=branch_state_dict
                     )
             else:
+                block_plan = adapter.get_activation_plan(skip_pre_modules=True, skip_post_modules=True)
                 for _, (layer, layer_cache, layer_kwargs) in tqdm(
                     config.calib.build_loader().iter_layer_activations(
-                        model,
-                        needs_inputs_fn=get_needs_inputs_fn(model, config),
+                        adapter,
+                        needs_inputs_fn=get_needs_inputs_fn(adapter, config),
                         skip_pre_modules=True,
                         skip_post_modules=True,
                     ),
                     desc="calibrating low-rank branches",
                     leave=False,
-                    total=model.num_blocks,
+                    total=len(block_plan.layers),
                     dynamic_ncols=True,
                 ):
                     calibrate_diffusion_block_low_rank_branch(
@@ -369,21 +332,24 @@ def quantize_diffusion_weights(
                     )
         tools.logging.Formatter.indent_dec()
 
-    skip_pre_modules = all(key in config.wgts.skips for key in model.get_prev_module_keys())
-    skip_post_modules = all(key in config.wgts.skips for key in model.get_post_module_keys())
+    skip_pre_modules = all(key in config.wgts.skips for key in adapter.get_prev_keys())
+    skip_post_modules = all(key in config.wgts.skips for key in adapter.get_post_keys())
+    activation_plan = adapter.get_activation_plan(
+        skip_pre_modules=skip_pre_modules, skip_post_modules=skip_post_modules
+    )
     with tools.logging.redirect_tqdm():
         if not quantizer_state_dict:
             if config.wgts.needs_calib_data:
                 iterable = config.calib.build_loader().iter_layer_activations(
-                    model,
-                    needs_inputs_fn=get_needs_inputs_fn(model, config),
+                    adapter,
+                    needs_inputs_fn=get_needs_inputs_fn(adapter, config),
                     skip_pre_modules=skip_pre_modules,
                     skip_post_modules=skip_post_modules,
                 )
             else:
                 iterable = map(  # noqa: C417
                     lambda kv: (kv[0], (kv[1], {}, {})),
-                    model.get_named_layers(
+                    adapter.get_named_layers(
                         skip_pre_modules=skip_pre_modules, skip_post_modules=skip_post_modules
                     ).items(),
                 )
@@ -391,7 +357,7 @@ def quantize_diffusion_weights(
                 iterable,
                 desc="calibrating weight quantizers",
                 leave=False,
-                total=model.num_blocks + int(not skip_post_modules) + int(not skip_pre_modules) * 3,
+                total=len(activation_plan.layers),
                 dynamic_ncols=True,
             ):
                 update_diffusion_block_weight_quantizer_state_dict(
@@ -404,21 +370,21 @@ def quantize_diffusion_weights(
     scale_state_dict: dict[str, torch.Tensor | float | None] = {}
     if config.wgts.enabled_gptq:
         iterable = config.calib.build_loader().iter_layer_activations(
-            model,
-            needs_inputs_fn=get_needs_inputs_fn(model, config),
+            adapter,
+            needs_inputs_fn=get_needs_inputs_fn(adapter, config),
             skip_pre_modules=skip_pre_modules,
             skip_post_modules=skip_post_modules,
         )
     else:
         iterable = map(  # noqa: C417
             lambda kv: (kv[0], (kv[1], {}, {})),
-            model.get_named_layers(skip_pre_modules=skip_pre_modules, skip_post_modules=skip_post_modules).items(),
+            adapter.get_named_layers(skip_pre_modules=skip_pre_modules, skip_post_modules=skip_post_modules).items(),
         )
     for _, (layer, layer_cache, _) in tqdm(
         iterable,
         desc="quantizing weights",
         leave=False,
-        total=model.num_blocks + int(not skip_post_modules) + int(not skip_pre_modules) * 3,
+        total=len(activation_plan.layers),
         dynamic_ncols=True,
     ):
         layer_scale_state_dict = quantize_diffusion_block_weights(
@@ -451,18 +417,16 @@ def load_diffusion_weights_state_dict(
         branch_state_dict (`dict[str, dict[str, torch.Tensor]]`):
             The state dict of the low-rank branches.
     """
-    if not isinstance(model, DiffusionModelStruct):
-        model = DiffusionModelStruct.construct(model)
-    assert isinstance(model, DiffusionModelStruct)
+    adapter = ensure_model_adapter(model)
     if config.enabled_wgts and config.wgts.enabled_low_rank:
         assert branch_state_dict is not None
         for _, layer in tqdm(
-            model.get_named_layers(skip_pre_modules=True, skip_post_modules=True).items(),
+            adapter.get_named_layers(skip_pre_modules=True, skip_post_modules=True).items(),
             desc="adding low-rank branches",
             leave=False,
             dynamic_ncols=True,
         ):
             calibrate_diffusion_block_low_rank_branch(layer=layer, config=config, branch_state_dict=branch_state_dict)
-    model.module.load_state_dict(state_dict)
+    adapter.get_root_module().load_state_dict(state_dict)
     gc.collect()
     torch.cuda.empty_cache()

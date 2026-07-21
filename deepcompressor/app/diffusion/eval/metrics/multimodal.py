@@ -34,7 +34,7 @@ def compute_image_multimodal_metrics(
     ref_dataset: datasets.Dataset,
     gen_dirpath: str,
     metrics: tuple[str, ...] = ("clip_iqa", "clip_score"),
-    batch_size: int = 64,
+    batch_size: int = 8,
     num_workers: int = 8,
     device: str | torch.device = "cuda",
 ) -> dict[str, float]:
